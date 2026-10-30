@@ -1152,6 +1152,26 @@ cfg_struct! {
         /// `INFR_EMBEDDING_RUNNER`: optional llama-server executable used by the managed embedding
         /// worker. Unset lets the embedding adapter discover a compatible runner.
         embedding_runner: Option<PathBuf> = None,
+        /// `INFR_RESPONSE_STORE_ENTRIES`: LRU bound on server-side `/v1/responses` state
+        /// (`previous_response_id` chains and `conversation` cursors). `0` (the default) keeps
+        /// the stateless contract — those fields are rejected with a 400 exactly as before.
+        ///
+        /// When ON, a chained request replays the stored message history and appends the new
+        /// turn, so the rebuilt prompt shares the previous turn's exact token prefix — which is
+        /// what any prefix-KV cache in front of it then hits. The store holds DTOs only: no KV is
+        /// pinned here and eviction of cached pages is unaffected.
+        response_store_entries: u32 = 0,
+        /// `INFR_RESPONSE_STORE_PATH`: file that mirrors the `/v1/responses` store, so
+        /// `previous_response_id`/`conversation` chains survive a restart. Unset (the default)
+        /// keeps the store in memory only — the privacy-preserving default, since the file holds
+        /// every stored prompt and response in the clear.
+        ///
+        /// Ignored when `response_store_entries` is 0 (the stateless contract has nothing to
+        /// mirror). Loaded once at startup — a missing file starts fresh, an unreadable or
+        /// unparsable one refuses to start rather than silently dropping the history — and
+        /// rewritten (write-to-temp, then rename) after every turn that changes the store, so the
+        /// I/O cost follows the total size of the retained turns.
+        response_store_path: Option<PathBuf> = None,
     }
 }
 

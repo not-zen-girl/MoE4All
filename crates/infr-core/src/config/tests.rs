@@ -2045,6 +2045,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
+        "INFR_RESPONSE_STORE_ENTRIES",
+        "INFR_RESPONSE_STORE_PATH",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
