@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Streamed tool-call arguments instead of one final blob: `/v1/chat/completions` now emits `delta.tool_calls[].function.arguments` fragments as the model writes them and sends only the remainder in the finished call, and `/v1/responses` forwards the same fragments as `response.function_call_arguments.delta` events.
+- Made `include:["reasoning.encrypted_content"]` return a store-backed `encrypted_content` handle (`rehs_<response_id>`) that a later request's `reasoning` input item resolves back into the prompt. When the server keeps no response state it DEGRADES instead of refusing: the turn returns summary-only reasoning items plus a `warnings` entry naming the missing state, because OpenAI-compatible adapters (pi-ai / DeepSeek Harness) send that include on every non-off thinking level and a 400 locked them out of reasoning altogether.
+- Added `serve.response_store_path` (`INFR_RESPONSE_STORE_PATH`) to mirror the `/v1/responses` store to a JSON file, so `previous_response_id` and `conversation` chains survive a restart. Unset stays memory-only and nothing a client said touches a disk; a configured file is loaded at startup and rewritten atomically after every change, and a file that cannot be parsed refuses to start instead of silently presenting an empty store.
+
+### Changed
+
+- Accepted `instructions` or a system/developer message on a chained Responses request when it is byte-identical to the system prefix already stored for that chain, instead of rejecting every resend.
+- Honoured `parallel_tool_calls=false` on `/v1/responses` by returning at most one call per turn and naming the withheld calls in `warnings`.
+- Raised the non-streaming `/v1/responses` translation ceiling from 16 MiB to 64 MiB and made an oversized upstream reply a named 502 instead of a bare failure.
+
+### Fixed
+
+- Replayed a `reasoning` input item from either wire shape: the `summary[]` this server emits, or the raw `content[].reasoning_text` that pi-ai and DeepSeek Harness keep and send back INSTEAD (they drop the summary). That shape used to fail the second turn with `400 reasoning item requires readable summary`; an item carrying neither text nor a store reference is now dropped instead of failing the turn.
+- Merged each assistant turn's reasoning, text and parallel `function_call` items back into ONE chat message on the way into the prompt. The Qwen3.8 template renders one `<|im_start|>assistant … <|im_end|>` block per message, so the old per-item split turned each real turn into three assistant turns, several of them "thought, then ended" — a pattern the model imitated by answering with an empty turn instead of calling the next tool.
+- Reported a request that outgrows the session KV window as `400 invalid_request_error` ("prompt 33676 + gen 0 exceeds the session KV capacity 32768") instead of a `500 server_error` that reads as a server fault; a client that drops the stream mid-generation already cancelled the decode and still does.
+- Accepted OpenAI's `reasoning.effort: "none"` on `/v1/responses` and `reasoning_effort: "none"` on `/v1/chat/completions`: it now turns thinking off for that request instead of failing with a 400 `unsupported reasoning effort` (DeepSeek Harness sends exactly this as soon as its thinking toggle is off). For Qwen3.8 models — whose template validates the level itself and accepts only low/medium/xhigh — `high` and `max` now snap to `xhigh` instead of failing the render with "Unexpected reasoning effort high", `minimal` keeps mapping to `low`, and a truly unknown level still 400s, now listing the accepted values.
+- Made a FORCED `tool_choice` (`"required"` or a named function) stream its call progressively like an automatic one: the grammar-constrained body now goes through the same splitter, so the function name and each completed argument member arrive while the call is still generating instead of as one frame at the end. A constrained call that cannot be completed after its name has already been streamed (for example `max_tokens` was reached) now fails loudly instead of silently retrying unconstrained and appending a second call's arguments to the first.
+
 ## [1.0.2] - 2026-10-15
 
 ### Added
