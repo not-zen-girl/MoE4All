@@ -1,37 +1,62 @@
-name: Windows Release (no codecs)
+name: Windows Release
 
 on:
-  workflow_dispatch: {}
+  push:
+    tags:
+      - 'release-*'
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-release-nocodecs-${{ github.ref }}
+  group: windows-release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Override .cargo/config.toml's developer-only target-cpu=native setting.
   RUSTFLAGS: '-C target-cpu=x86-64 -C target-feature=+crt-static'
   VULKAN_SDK_VERSION: '1.4.357.0'
 
 jobs:
   package:
-    name: Build MoE4All Windows package without image codecs
+    name: Build MoE4All Windows package
     runs-on: windows-2025
     timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: ./.github/actions/setup-build-cache
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release-x86-64
-          cache-on-failure: true
+
+      - name: Resolve and validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $metadata = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $package = $metadata.packages | Where-Object { $_.name -eq 'infr-cli' } | Select-Object -First 1
+          if ($null -eq $package) { throw 'infr-cli is missing from cargo metadata.' }
+          $version = [string]$package.version
+          $expectedTag = "release-$version"
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -ne $expectedTag) {
+            throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
+          }
+          $packageName = "MoE4All-Windows-x86_64-v$version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($version.Contains('-').ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=$packageName.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Cache Vulkan SDK
         uses: actions/cache@v4
@@ -41,35 +66,67 @@ jobs:
       - name: Install Vulkan shader compiler
         shell: pwsh
         run: .\scripts\install-vulkan-sdk-windows.ps1
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
 
+      - name: Test Windows platform code
+        shell: pwsh
+        run: |
+          cargo check --locked -p infr-hub --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-hub model_ref::tests::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build portable MoE4All engine (infr.exe)
-        run: cargo build --release --locked -p infr-cli --features tts
-      - name: Build standalone console client (infr-console.exe)
-        run: cargo build --release --locked -p infr-console
-      - name: Show sccache statistics
-        if: always()
-        run: sccache --show-stats
+        run: cargo build --release --locked -p infr-cli
 
       - name: Create release archive
         shell: pwsh
-        run: .\scripts\package-windows.ps1 -Version '1.3.0' -WithoutImageCodecs
+        run: .\scripts\package-windows.ps1 -Version '${{ steps.release.outputs.version }}'
       - name: Smoke-test extracted CMD package
         shell: pwsh
         run: |
           $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
-          Expand-Archive -LiteralPath '.\dist\MoE4All-Windows-x86_64-v1.3.0.zip' -DestinationPath $extractPath
-          $packageRoot = Join-Path $extractPath 'MoE4All-Windows-x86_64-v1.3.0'
-          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '1.3.0' -SkipInteractiveDeviceChecks
+          Expand-Archive -LiteralPath '.\dist\${{ steps.release.outputs.archive_name }}' -DestinationPath $extractPath
+          $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
+          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}'
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
-          name: MoE4All-Windows-x86_64-v1.3.0-nocodecs
+          name: ${{ steps.release.outputs.package_name }}
           path: |
-            dist/MoE4All-Windows-x86_64-v1.3.0.zip
-            dist/MoE4All-Windows-x86_64-v1.3.0.zip.sha256
+            dist/${{ steps.release.outputs.archive_name }}
+            dist/${{ steps.release.outputs.archive_name }}.sha256
           if-no-files-found: error
           retention-days: 14
+
+      - name: Attest release archive
+        if: startsWith(github.ref, 'refs/tags/release-')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive_name }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/release-')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $assets = @(
+            '.\dist\${{ steps.release.outputs.archive_name }}'
+            '.\dist\${{ steps.release.outputs.archive_name }}.sha256'
+          )
+          $releaseFlags = @()
+          if ('${{ steps.release.outputs.prerelease }}' -eq 'true') {
+            $releaseFlags += '--prerelease'
+          }
+          & gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "GitHub Release upload failed with exit code $LASTEXITCODE" }
+            & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
+          } else {
+            & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes @releaseFlags
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }
